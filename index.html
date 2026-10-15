@@ -115,7 +115,7 @@
                 <span>🚏</span> <span>Horaires & Arrêts</span>
             </button>
             <button onclick="switchTab('radar')" id="tab-btn-radar" class="tab-btn flex-1 min-w-[120px] py-2.5 px-3 rounded-lg text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all bg-tec-surfaceLight text-tec-muted hover:text-tec-text hover:bg-tec-surface">
-                <span>🧭</span> <span>Radar & Carte</span>
+                <span>🗺️</span> <span>Carte</span>
             </button>
             <button onclick="switchTab('redaction')" id="tab-btn-redaction" class="tab-btn flex-1 min-w-[120px] py-2.5 px-3 rounded-lg text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all bg-tec-surfaceLight text-tec-muted hover:text-tec-text hover:bg-tec-surface">
                 <span>✍️</span> <span>Procès-Verbal</span>
@@ -216,7 +216,7 @@
                                 <span>→</span>
                             </button>
                             <button onclick="switchTab('radar')" class="w-full py-3 px-4 bg-tec-surfaceLight hover:bg-tec-border text-tec-text font-bold rounded-lg text-sm flex items-center justify-between transition">
-                                <span>🗺️ Voir les arrêts autour de moi</span>
+                                <span>🗺️ Carte et arrêts autour de moi</span>
                                 <span>→</span>
                             </button>
                         </div>
@@ -310,7 +310,7 @@
         </section>
 
         <!-- ========================================================= -->
-        <!-- ONGLET 3 : RADAR & CARTE DE PROXIMITÉ                    -->
+        <!-- ONGLET 3 : CARTE & ARRÊTS À PROXIMITÉ                    -->
         <!-- ========================================================= -->
         <section id="tab-radar" class="tab-content hidden space-y-4"><div id="geo-card" class="bg-tec-surface p-4 rounded-xl border border-tec-border space-y-3">
 <h3 class="text-sm font-bold text-tec-yellow">📍 GPS, carte OpenStreetMap & alertes de passage</h3>
@@ -328,9 +328,9 @@
                 <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4">
                     <div>
                         <h2 class="text-base sm:text-lg font-bold text-tec-yellow flex items-center gap-2">
-                            <span>🧭</span> Radar Tactique & Arrêts Proches (Périmètre Charleroi)
+                            <span>🗺️</span> Carte TEC & Arrêts à proximité
                         </h2>
-                        <p class="text-xs text-tec-muted">Calcul géodésique de proximité autour de la position opérationnelle de l'agent.</p>
+                        <p class="text-xs text-tec-muted">Carte du réseau TEC (letecfinder.be) et arrêts les plus proches de la position de l'agent.</p>
                     </div>
 
                     <!-- Sélecteur de position simulée -->
@@ -344,21 +344,19 @@
                     </div>
                 </div>
 
-                <!-- Simulation Radar Schématique -->
-                <div class="grid grid-cols-1 md:grid-cols-12 gap-4">
-                    <div class="md:col-span-6 bg-tec-dark rounded-xl p-4 border border-tec-border flex flex-col items-center justify-center relative min-h-[300px]">
-                        <!-- Canvas Radar -->
-                        <canvas id="radar-canvas" width="280" height="280" class="rounded-full bg-tec-surface/40 border-2 border-tec-yellow/30 shadow-inner"></canvas>
-                        <div class="absolute bottom-2 left-3 text-[11px] text-tec-muted font-mono">
-                            Portée radar : <span class="text-tec-yellow">800 m</span>
+                <!-- Carte TEC (letecfinder.be) à la place du radar -->
+                <div class="space-y-3">
+                    <div class="bg-tec-dark rounded-xl border border-tec-border overflow-hidden">
+                        <div class="flex flex-wrap items-center justify-between gap-2 p-2 border-b border-tec-border text-xs">
+                            <span class="font-bold text-tec-yellow">🗺️ Carte TEC (letecfinder.be)</span>
+                            <a href="https://letecfinder.be/map/" target="_blank" rel="noopener" class="bg-tec-yellow text-tec-dark px-3 py-2 rounded font-bold">Ouvrir la carte TEC ↗</a>
                         </div>
-                        <div class="absolute bottom-2 right-3 text-[11px] text-tec-muted font-mono">
-                            GPS : <span class="text-tec-success">FIX VERIFIED</span>
-                        </div>
+                        <iframe id="tec-map-frame" src="https://letecfinder.be/map/" title="Carte TEC" loading="lazy" referrerpolicy="no-referrer" class="w-full bg-white" style="height:60vh;min-height:360px;border:0"></iframe>
+                        <p class="p-2 text-[11px] text-tec-muted">Si la carte reste blanche, le site refuse l'affichage intégré : utilise le bouton « Ouvrir la carte TEC ».</p>
                     </div>
 
                     <!-- Liste des arrêts les plus proches classés par distance -->
-                    <div class="md:col-span-6 space-y-2.5 max-h-[320px] overflow-y-auto pr-1" id="radar-stops-list">
+                    <div class="space-y-2.5 max-h-[320px] overflow-y-auto pr-1" id="radar-stops-list">
                         <!-- Rempli par JavaScript -->
                     </div>
                 </div>
