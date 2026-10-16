@@ -8,17 +8,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2
 from google.protobuf.json_format import MessageToDict
 
-app = FastAPI(title="TEC Service Contrôle API")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+app = FastAPI(
+    title="TEC Service Contrôle API",
+    description="Passerelle sécurisée vers les flux officiels TEC.",
+    version="1.1.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://roulet4-lang.github.io"],
+    allow_origins=[
+        "https://roulet4-lang.github.io",
+    ],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("BM_API_KEY", "")
-API_BASE = os.getenv("BM_API_BASE", "").rstrip("/")
+API_KEY = os.getenv("BM_API_KEY", "").strip()
+API_BASE = os.getenv("BM_API_BASE", "").strip().rstrip("/")
 
 FEEDS = {
     "vehicles": "/api/gtfs/feed/tec/rt/vehicle-position",
@@ -27,46 +38,89 @@ FEEDS = {
 }
 
 
-async def fetch_feed(path):
+# ============================================================
+# CONNEXION AUX FLUX BELGIAN MOBILITY
+# ============================================================
+
+async def fetch_feed(path: str) -> dict:
     if not API_KEY or not API_BASE:
         raise HTTPException(
             status_code=503,
-            detail="BM_API_KEY ou BM_API_BASE non configurée sur Render.",
+            detail=(
+                "Configuration Render incomplète : "
+                "BM_API_KEY ou BM_API_BASE manquante."
+            ),
         )
 
+    if not API_BASE.startswith("https://"):
+        raise HTTPException(
+            status_code=503,
+            detail="BM_API_BASE doit commencer par https://",
+        )
+
+    url = API_BASE + path
+
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
-                API_BASE + path,
+                url,
+                params={"format": "protobuf"},
                 headers={
                     "Ocp-Apim-Subscription-Key": API_KEY,
                     "Accept": "application/x-protobuf",
                 },
             )
-    except httpx.HTTPError:
+
+    except httpx.TimeoutException:
         raise HTTPException(
-            status_code=502,
-            detail="Connexion à Belgian Mobility impossible.",
+            status_code=504,
+            detail="Délai dépassé lors de la connexion à Belgian Mobility.",
         )
 
+    except httpx.HTTPError as exc:
+        # Ne jamais inclure les en-têtes ou la clé API dans les erreurs.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur réseau vers Belgian Mobility : {type(exc).__name__}.",
+        )
+
+    # Diagnostic des erreurs renvoyées par l'API distante.
     if response.status_code in (401, 403):
         raise HTTPException(
             status_code=502,
-            detail="Accès refusé par Belgian Mobility. Vérifie l'abonnement.",
+            detail=(
+                f"Accès refusé par Belgian Mobility (HTTP "
+                f"{response.status_code}). Vérifie l'abonnement, "
+                "la clé et les autorisations."
+            ),
+        )
+
+    if response.status_code == 404:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Endpoint introuvable (HTTP 404) : {path}. "
+                "Vérifie l'URL de base, le chemin et les paramètres "
+                "dans le portail Belgian Mobility."
+            ),
         )
 
     if response.status_code == 429:
         raise HTTPException(
             status_code=503,
-            detail="Limite de requêtes API atteinte.",
+            detail="Limite de requêtes Belgian Mobility atteinte.",
         )
 
     if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
-            detail=f"Belgian Mobility a répondu HTTP {response.status_code}.",
+            detail=(
+                f"Belgian Mobility a répondu HTTP "
+                f"{response.status_code} pour {path}."
+            ),
         )
 
+    # Décodage du flux GTFS-RT au format Protocol Buffers.
     feed = gtfs_realtime_pb2.FeedMessage()
 
     try:
@@ -74,7 +128,11 @@ async def fetch_feed(path):
     except Exception:
         raise HTTPException(
             status_code=502,
-            detail="Réponse reçue, mais format GTFS-RT invalide.",
+            detail=(
+                f"Réponse reçue pour {path}, mais impossible "
+                "de la décoder en GTFS-Realtime protobuf. "
+                "Vérifie le format réellement renvoyé par l'API."
+            ),
         )
 
     data = MessageToDict(
@@ -83,32 +141,50 @@ async def fetch_feed(path):
         use_integers_for_enums=True,
     )
 
+    header = data.get("header", {})
+    entities = data.get("entity", [])
+
     return {
         "source": "Belgian Mobility / TEC",
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
-        "feed_timestamp": data.get("header", {}).get("timestamp"),
-        "count": len(data.get("entity", [])),
-        "entities": data.get("entity", []),
+        "feed_timestamp": header.get("timestamp"),
+        "feed_version": header.get("gtfs_realtime_version"),
+        "incrementality": header.get("incrementality"),
+        "count": len(entities),
+        "entities": entities,
     }
 
+
+# ============================================================
+# ROUTES PRINCIPALES
+# ============================================================
 
 @app.get("/")
 def home():
     return {
         "service": "TEC Service Contrôle API",
+        "version": "1.1.0",
+        "status": "online",
         "health": "/health",
         "docs": "/docs",
+        "connection_test": "/api/tec/connection-test",
     }
 
 
 @app.get("/health")
 def health():
+    # Vérifie uniquement la configuration locale,
+    # pas la connexion réelle à Belgian Mobility.
     return {
         "status": "ok",
         "api_key_configured": bool(API_KEY),
         "api_base_configured": bool(API_BASE),
     }
 
+
+# ============================================================
+# TEST DES TROIS FLUX
+# ============================================================
 
 @app.get("/api/tec/connection-test")
 async def connection_test():
@@ -117,11 +193,13 @@ async def connection_test():
     for name, path in FEEDS.items():
         try:
             data = await fetch_feed(path)
+
             results[name] = {
                 "ok": True,
                 "count": data["count"],
                 "feed_timestamp": data["feed_timestamp"],
             }
+
         except HTTPException as exc:
             results[name] = {
                 "ok": False,
@@ -129,20 +207,33 @@ async def connection_test():
             }
 
     return {
-        "all_ok": all(x["ok"] for x in results.values()),
+        "all_ok": all(item["ok"] for item in results.values()),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
         "feeds": results,
     }
 
+
+# ============================================================
+# VEHICULES EN TEMPS REEL
+# ============================================================
 
 @app.get("/api/tec/vehicles")
 async def vehicles():
     return await fetch_feed(FEEDS["vehicles"])
 
 
+# ============================================================
+# MISES A JOUR DES TRAJETS
+# ============================================================
+
 @app.get("/api/tec/trips")
 async def trips():
     return await fetch_feed(FEEDS["trips"])
 
+
+# ============================================================
+# ALERTES ET PERTURBATIONS
+# ============================================================
 
 @app.get("/api/tec/alerts")
 async def alerts():
