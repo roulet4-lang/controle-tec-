@@ -117,6 +117,9 @@
             <button onclick="switchTab('radar')" id="tab-btn-radar" class="tab-btn flex-1 min-w-[120px] py-2.5 px-3 rounded-lg text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all bg-tec-surfaceLight text-tec-muted hover:text-tec-text hover:bg-tec-surface">
                 <span>🗺️</span> <span>Carte</span>
             </button>
+            <button onclick="switchTab('assistant-controle')" id="tab-btn-assistant-controle" class="tab-btn flex-1 min-w-[150px] py-2.5 px-3 rounded-lg text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all bg-tec-surfaceLight text-tec-muted hover:text-tec-text hover:bg-tec-surface">
+                <span>🧠</span> <span>Assistant contrôle</span>
+            </button>
             <button onclick="switchTab('redaction')" id="tab-btn-redaction" class="tab-btn flex-1 min-w-[120px] py-2.5 px-3 rounded-lg text-xs sm:text-sm font-bold flex items-center justify-center gap-2 transition-all bg-tec-surfaceLight text-tec-muted hover:text-tec-text hover:bg-tec-surface">
                 <span>✍️</span> <span>Procès-Verbal</span>
             </button>
@@ -359,6 +362,55 @@
                     <div class="space-y-2.5 max-h-[320px] overflow-y-auto pr-1" id="radar-stops-list">
                         <!-- Rempli par JavaScript -->
                     </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ========================================================= -->
+        <!-- NOUVEL ONGLET : ASSISTANT DE RECOMMANDATION               -->
+        <!-- ========================================================= -->
+        <section id="tab-assistant-controle" class="tab-content hidden space-y-4">
+            <div class="bg-tec-surface p-4 sm:p-5 rounded-xl border border-tec-border shadow space-y-4">
+                <div class="flex items-start gap-3">
+                    <div class="bg-tec-yellow text-tec-dark rounded-xl p-3 text-2xl">🧠</div>
+                    <div class="flex-1">
+                        <h2 class="text-base sm:text-lg font-bold text-tec-yellow">Assistant de recommandation des contrôles</h2>
+                        <p class="text-sm text-tec-muted mt-1">Classe les arrêts selon les horaires locaux disponibles, la diversité des lignes et les passages rapprochés.</p>
+                    </div>
+                </div>
+                <div class="rounded-lg border border-tec-yellow/40 bg-tec-dark p-3 text-sm">
+                    <div class="font-bold text-tec-yellow">Mode actuel : analyse des horaires théoriques</div>
+                    <p class="text-tec-muted mt-1">Aucun flux officiel temps réel ni modèle IA distant n'est connecté dans cette version. Les résultats sont indicatifs et ne confirment pas la position réelle d'un bus.</p>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <label class="text-xs font-bold text-tec-muted space-y-1">Ligne à privilégier (facultatif)
+                        <input id="ac-line" type="text" placeholder="Ex. 86, 18, M3" class="w-full bg-tec-dark border border-tec-border rounded-lg p-3 text-sm text-tec-text" />
+                    </label>
+                    <label class="text-xs font-bold text-tec-muted space-y-1">Fenêtre d'analyse
+                        <select id="ac-window" class="w-full bg-tec-dark border border-tec-border rounded-lg p-3 text-sm text-tec-text">
+                            <option value="30">30 prochaines minutes</option><option value="60" selected>60 prochaines minutes</option><option value="120">120 prochaines minutes</option><option value="240">4 prochaines heures</option>
+                        </select>
+                    </label>
+                    <label class="text-xs font-bold text-tec-muted space-y-1">Secteur
+                        <select id="ac-zone" class="w-full bg-tec-dark border border-tec-border rounded-lg p-3 text-sm text-tec-text">
+                            <option value="all">Tout le réseau présent dans la base</option><option value="Charleroi">Charleroi</option><option value="Jumet">Jumet</option><option value="Gosselies">Gosselies</option><option value="Marchienne-Au-Pont">Marchienne-au-Pont</option><option value="Marcinelle">Marcinelle</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <button onclick="runControlAdvisor()" class="bg-tec-yellow text-tec-dark px-4 py-3 rounded-lg font-black text-sm">Analyser les points de contrôle</button>
+                    <button onclick="document.getElementById('ac-line').value='';document.getElementById('ac-zone').value='all';runControlAdvisor()" class="bg-tec-surfaceLight border border-tec-border px-4 py-3 rounded-lg font-bold text-sm">Réinitialiser</button>
+                </div>
+                <div id="ac-summary" class="text-sm text-tec-muted" aria-live="polite">Lance une analyse pour classer les arrêts à partir des horaires disponibles.</div>
+                <div class="overflow-x-auto rounded-lg border border-tec-border">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-tec-dark text-tec-muted text-xs uppercase"><tr><th class="p-3">Arrêt recommandé</th><th class="p-3">Indicateurs</th><th class="p-3">Score</th><th class="p-3">Action</th></tr></thead>
+                        <tbody id="ac-results"><tr><td colspan="4" class="p-4 text-center text-tec-muted">Aucune analyse lancée.</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="text-xs text-tec-muted space-y-1">
+                    <p><strong>Calcul du score :</strong> volume de passages théoriques dans la fenêtre, diversité des lignes et passages rapprochés.</p>
+                    <p><strong>Limites :</strong> la qualité dépend de la correspondance entre les arrêts, les lignes et les horaires de la base locale. Les coordonnées GPS et les conditions d'accès doivent être validées avant une utilisation opérationnelle.</p>
                 </div>
             </div>
         </section>
@@ -1187,7 +1239,55 @@ runLocalAIRenforcement=function(){const box=document.getElementById('ai-feedback
 function dl(name,type,data){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
 function exportPV(kind){const t=document.getElementById('pv-modal-text').textContent,n='PV_'+new Date().toISOString().slice(0,10);
  if(kind==='txt')dl(n+'.txt','text/plain;charset=utf-8',t);
- else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre></body></html>')}
+ else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre>
+<script>
+/* Assistant de recommandation local. Utilise les horaires théoriques déjà chargés dans SCHED/TRIPS. */
+function runControlAdvisor(){
+ const out=document.getElementById('ac-results'),summary=document.getElementById('ac-summary');
+ if(!out||typeof NETWORK_STOPS==='undefined'||typeof SCHED==='undefined'||typeof TRIPS==='undefined'){
+  if(out)out.innerHTML='<tr><td colspan="4" class="p-4 text-center text-tec-danger">Les données horaires locales ne sont pas accessibles.</td></tr>';
+  return;
+ }
+ const line=document.getElementById('ac-line').value.trim().toLowerCase().replace(/^ligne\s*/,''),zone=document.getElementById('ac-zone').value;
+ const windowMin=Number(document.getElementById('ac-window').value)||60,now=new Date(),start=now.getHours()*60+now.getMinutes(),day=String(now.getDay()||7),end=start+windowMin;
+ const rows=[];
+ for(const stop of NETWORK_STOPS){
+  if(zone!=='all' && !(String(stop.zone||'').toLowerCase().includes(zone.toLowerCase()) || stop.name.toLowerCase().includes(zone.toLowerCase())))continue;
+  if(line && !stop.lines.some(x=>String(x).toLowerCase()===line))continue;
+  const events=SCHED[stop.id]||[],seen=new Set(),passages=[],lines=new Set();
+  for(let i=0;i<events.length;i+=2){
+   const mins=Number(events[i]),trip=TRIPS[events[i+1]];
+   if(!trip||!(Array.isArray(trip[1]) ? trip[1].map(String).includes(day) : String(trip[1]||'').includes(day)))continue;
+   let adjusted=mins;
+   if(adjusted<start)continue;
+   if(adjusted>=end)continue;
+   const key=String(trip[0])+'@'+adjusted;
+   if(seen.has(key))continue;seen.add(key);passages.push({mins:adjusted,line:String(trip[0])});lines.add(String(trip[0]));
+  }
+  if(!passages.length)continue;
+  passages.sort((a,b)=>a.mins-b.mins);
+  let peak=0;
+  for(let i=0;i<passages.length;i++){
+   const inTen=passages.filter(p=>p.mins>=passages[i].mins && p.mins<=passages[i].mins+10);
+   peak=Math.max(peak,new Set(inTen.map(p=>p.line)).size);
+  }
+  rows.push({stop,passages:passages.length,lineCount:lines.size,peak,first:passages[0].mins});
+ }
+ if(!rows.length){out.innerHTML='<tr><td colspan="4" class="p-4 text-center text-tec-muted">Aucun passage théorique trouvé pour ces critères et cette plage horaire.</td></tr>';summary.textContent='Aucun résultat. Essaie une fenêtre plus large ou retire le filtre de ligne.';return;}
+ const maxP=Math.max(1,...rows.map(r=>r.passages)),maxL=Math.max(1,...rows.map(r=>r.lineCount)),maxK=Math.max(1,...rows.map(r=>r.peak));
+ rows.forEach(r=>{r.score=Math.round(55*r.passages/maxP+25*r.lineCount/maxL+20*r.peak/maxK)});
+ rows.sort((a,b)=>b.score-a.score || b.passages-a.passages);
+ const fmt=m=>String(Math.floor(m/60)%24).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+ out.innerHTML=rows.slice(0,15).map(r=>{
+  const safeId=String(r.stop.id).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  const linesText=(r.stop.lines||[]).slice(0,8).join(', ');
+  return `<tr class="border-t border-tec-border hover:bg-tec-surfaceLight/40"><td class="p-3 font-bold">${r.stop.name}<div class="text-xs text-tec-muted font-normal mt-1">${r.stop.zone||'Secteur non précisé'} · premier passage ${fmt(r.first)}</div></td><td class="p-3 text-xs text-tec-muted">${r.passages} passages<br>${r.lineCount} lignes observées<br>Pic rapproché : ${r.peak}<div class="mt-1">Lignes arrêt : ${linesText}</div></td><td class="p-3"><span class="font-black text-tec-yellow">${r.score}/100</span></td><td class="p-3"><button onclick="goStop('${safeId}')" class="bg-tec-yellow text-tec-dark px-3 py-2 rounded font-bold text-xs">Voir l'arrêt</button></td></tr>`;
+ }).join('');
+ summary.innerHTML=`<span class="text-tec-text font-bold">${Math.min(rows.length,15)} arrêts affichés sur ${rows.length} candidats.</span> Fenêtre : ${windowMin} min à partir de ${fmt(start)}. <span class="text-tec-yellow">Horaires théoriques uniquement.</span>`;
+}
+</script>
+
+</body></html>')}
 window.addEventListener('DOMContentLoaded',()=>{
  const z=new Date();z.setMinutes(z.getMinutes()-z.getTimezoneOffset());document.getElementById('pv-when').value=z.toISOString().slice(0,16);
  try{const a=JSON.parse(localStorage.getItem('tec_agent')||'{}');if(a.n)document.getElementById('pv-agent-name').value=a.n;if(a.b)document.getElementById('pv-agent-badge').value=a.b}catch(e){}
