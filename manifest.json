@@ -1,0 +1,9 @@
+{
+  "name":"Contrôle TEC Charleroi",
+  "short_name":"TEC Contrôle",
+  "start_url":"./index.html",
+  "display":"standalone",
+  "background_color":"#121316",
+  "theme_color":"#FFCC00",
+  "lang":"fr-BE"
+}
