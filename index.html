@@ -1239,8 +1239,7 @@ runLocalAIRenforcement=function(){const box=document.getElementById('ai-feedback
 function dl(name,type,data){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
 function exportPV(kind){const t=document.getElementById('pv-modal-text').textContent,n='PV_'+new Date().toISOString().slice(0,10);
  if(kind==='txt')dl(n+'.txt','text/plain;charset=utf-8',t);
- else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre>
-<script>
+ else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre></body></html>')}
 /* Assistant de recommandation local. Utilise les horaires théoriques déjà chargés dans SCHED/TRIPS. */
 function runControlAdvisor(){
  const out=document.getElementById('ac-results'),summary=document.getElementById('ac-summary');
@@ -1285,9 +1284,7 @@ function runControlAdvisor(){
  }).join('');
  summary.innerHTML=`<span class="text-tec-text font-bold">${Math.min(rows.length,15)} arrêts affichés sur ${rows.length} candidats.</span> Fenêtre : ${windowMin} min à partir de ${fmt(start)}. <span class="text-tec-yellow">Horaires théoriques uniquement.</span>`;
 }
-</script>
 
-</body></html>')}
 window.addEventListener('DOMContentLoaded',()=>{
  const z=new Date();z.setMinutes(z.getMinutes()-z.getTimezoneOffset());document.getElementById('pv-when').value=z.toISOString().slice(0,16);
  try{const a=JSON.parse(localStorage.getItem('tec_agent')||'{}');if(a.n)document.getElementById('pv-agent-name').value=a.n;if(a.b)document.getElementById('pv-agent-badge').value=a.b}catch(e){}
