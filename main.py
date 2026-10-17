@@ -16,7 +16,7 @@ from google.protobuf.json_format import MessageToDict
 app = FastAPI(
     title="TEC Service Contrôle API",
     description="Passerelle sécurisée vers les flux officiels TEC.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -74,24 +74,28 @@ async def fetch_feed(path: str) -> dict:
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
-            detail="Délai dépassé lors de la connexion à Belgian Mobility.",
+            detail=(
+                "Délai dépassé lors de la connexion "
+                "à Belgian Mobility."
+            ),
         )
 
     except httpx.HTTPError as exc:
-        # Ne jamais inclure les en-têtes ou la clé API dans les erreurs.
         raise HTTPException(
             status_code=502,
-            detail=f"Erreur réseau vers Belgian Mobility : {type(exc).__name__}.",
+            detail=(
+                "Erreur réseau vers Belgian Mobility : "
+                f"{type(exc).__name__}."
+            ),
         )
 
-    # Diagnostic des erreurs renvoyées par l'API distante.
     if response.status_code in (401, 403):
         raise HTTPException(
             status_code=502,
             detail=(
-                f"Accès refusé par Belgian Mobility (HTTP "
-                f"{response.status_code}). Vérifie l'abonnement, "
-                "la clé et les autorisations."
+                f"Accès refusé par Belgian Mobility "
+                f"(HTTP {response.status_code}). "
+                "Vérifie l'abonnement, la clé et les autorisations."
             ),
         )
 
@@ -120,7 +124,7 @@ async def fetch_feed(path: str) -> dict:
             ),
         )
 
-    # Décodage du flux GTFS-RT au format Protocol Buffers.
+    # Décodage du flux GTFS-Realtime au format Protocol Buffers.
     feed = gtfs_realtime_pb2.FeedMessage()
 
     try:
@@ -156,25 +160,29 @@ async def fetch_feed(path: str) -> dict:
 
 
 # ============================================================
-# ROUTES PRINCIPALES
+# ROUTE D'ACCUEIL
 # ============================================================
 
 @app.get("/")
 def home():
     return {
         "service": "TEC Service Contrôle API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "status": "online",
         "health": "/health",
         "docs": "/docs",
         "connection_test": "/api/tec/connection-test",
+        "static_summary": "/api/tec/static/summary",
     }
 
 
+# ============================================================
+# VERIFICATION DE L'API
+# ============================================================
+
 @app.get("/health")
 def health():
-    # Vérifie uniquement la configuration locale,
-    # pas la connexion réelle à Belgian Mobility.
+    # Vérifie la configuration locale, pas les flux distants.
     return {
         "status": "ok",
         "api_key_configured": bool(API_KEY),
@@ -209,6 +217,39 @@ async def connection_test():
     return {
         "all_ok": all(item["ok"] for item in results.values()),
         "checked_at": datetime.now(timezone.utc).isoformat(),
+        "feeds": results,
+    }
+
+
+# ============================================================
+# NOUVELLE ROUTE : RESUME DES FLUX TEC
+# ============================================================
+
+@app.get("/api/tec/static/summary")
+async def static_summary():
+    results = {}
+
+    for name, path in FEEDS.items():
+        try:
+            data = await fetch_feed(path)
+
+            results[name] = {
+                "ok": True,
+                "count": data["count"],
+                "feed_timestamp": data["feed_timestamp"],
+                "retrieved_at": data["retrieved_at"],
+            }
+
+        except HTTPException as exc:
+            results[name] = {
+                "ok": False,
+                "error": exc.detail,
+            }
+
+    return {
+        "service": "TEC Service Contrôle API",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "all_ok": all(item["ok"] for item in results.values()),
         "feeds": results,
     }
 
