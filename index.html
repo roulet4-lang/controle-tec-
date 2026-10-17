@@ -1239,7 +1239,180 @@ runLocalAIRenforcement=function(){const box=document.getElementById('ai-feedback
 function dl(name,type,data){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type}));a.download=name;document.body.appendChild(a);a.click();a.remove()}
 function exportPV(kind){const t=document.getElementById('pv-modal-text').textContent,n='PV_'+new Date().toISOString().slice(0,10);
  if(kind==='txt')dl(n+'.txt','text/plain;charset=utf-8',t);
- else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre></body></html>')}
+ else dl(n+'.doc','application/msword','<html><head><meta charset="utf-8"></head><body><pre style="font-family:Arial;font-size:11pt;white-space:pre-wrap">'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre><script>
+/* TEC Service Contrôle — liaison prudente aux flux GTFS-RT réels.
+   Ne calcule ni ne simule des heures de passage ou des retards.
+   Les identifiants GTFS ne sont pas rapprochés d'un arrêt local tant que le référentiel statique officiel n'est pas déployé. */
+(() => {
+  'use strict';
+  const API_BASE = 'https://controle-tec.onrender.com';
+  const REFRESH_MS = 60000;
+  const state = { lastOk: null, feeds: {}, busy: false };
+  const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+  const esc = (v) => String(v == null ? '' : v);
+  const fmtTime = (v) => { const n = Number(v); if (!Number.isFinite(n) || n <= 0) return 'horodatage indisponible'; return new Date(n * 1000).toLocaleTimeString('fr-BE', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
+  function getTranslated(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    const translations = value.translation || value.translations || [];
+    const preferred = translations.find(x => String(x.language || '').toLowerCase().startsWith('fr')) || translations[0];
+    return preferred ? (preferred.text || '') : '';
+  }
+  function ensurePanel() {
+    if (document.getElementById('tec-rt-panel')) return;
+    const style = el('style');
+    style.textContent = `#tec-rt-panel{position:fixed;right:14px;bottom:14px;z-index:9999;width:min(370px,calc(100vw - 28px));font:13px/1.4 system-ui,-apple-system,sans-serif;color:#f4f4f5;background:#111827;border:1px solid #374151;border-radius:12px;box-shadow:0 12px 35px #0005;overflow:hidden}#tec-rt-panel button{cursor:pointer}#tec-rt-head{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#1f2937}#tec-rt-head strong{flex:1;font-size:13px}#tec-rt-dot{width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block}#tec-rt-refresh,#tec-rt-toggle{border:1px solid #4b5563;border-radius:6px;padding:4px 7px;background:#111827;color:#f9fafb}#tec-rt-body{padding:10px 12px;max-height:42vh;overflow:auto}#tec-rt-summary{color:#d1d5db;margin-bottom:8px}#tec-rt-feeds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}#tec-rt-feeds .metric{background:#1f2937;border-radius:7px;padding:8px 6px;text-align:center}#tec-rt-feeds .num{font-size:20px;font-weight:800;color:#facc15}#tec-rt-feeds .lab{font-size:10px;color:#d1d5db}#tec-rt-alerts{margin-top:10px}#tec-rt-alerts h4{font-weight:700;margin:0 0 5px}#tec-rt-alerts ul{padding-left:17px;margin:0}#tec-rt-alerts li{margin:4px 0;color:#fde68a}#tec-rt-foot{font-size:10px;color:#9ca3af;margin-top:9px}#tec-rt-panel[ data-collapsed='true'] #tec-rt-body{display:none}@media(max-width:560px){#tec-rt-panel{bottom:76px;right:8px;width:calc(100vw - 16px)}}`;
+    document.head.appendChild(style);
+    const panel = el('section'); panel.id = 'tec-rt-panel'; panel.setAttribute('aria-label', 'État des flux temps réel TEC');
+    const head = el('div'); head.id = 'tec-rt-head';
+    const dot = el('span'); dot.id = 'tec-rt-dot';
+    const title = el('strong', '', 'Flux temps réel TEC');
+    const refresh = el('button', '', 'Actualiser'); refresh.id = 'tec-rt-refresh'; refresh.type = 'button';
+    const toggle = el('button', '', '−'); toggle.id = 'tec-rt-toggle'; toggle.type = 'button'; toggle.setAttribute('aria-label', 'Réduire ou développer le panneau');
+    head.append(dot, title, refresh, toggle);
+    const body = el('div'); body.id = 'tec-rt-body';
+    const summary = el('div', '', 'Connexion aux flux en cours…'); summary.id = 'tec-rt-summary';
+    const feeds = el('div'); feeds.id = 'tec-rt-feeds';
+    [['vehicles','Véhicules'],['trips','Mises à jour'],['alerts','Alertes']].forEach(([key,label]) => {
+      const card = el('div'); card.className = 'metric';
+      const num = el('div','num','—'); num.id = `tec-rt-${key}-count`;
+      const lab = el('div','lab',label);
+      card.append(num,lab); feeds.appendChild(card);
+    });
+    const alertsBox = el('div'); alertsBox.id = 'tec-rt-alerts';
+    const ah = el('h4','','Alertes reçues (flux officiel)');
+    const ul = el('ul'); ul.id = 'tec-rt-alert-list';
+    alertsBox.append(ah,ul);
+    const foot = el('div','', 'Les nombres sont des entités reçues, pas nécessairement des véhicules actifs ou des perturbations en cours. Aucune heure de passage ni aucun retard n’est simulé.'); foot.id = 'tec-rt-foot';
+    body.append(summary,feeds,alertsBox,foot); panel.append(head,body); document.body.appendChild(panel);
+    refresh.addEventListener('click', () => poll(true));
+    toggle.addEventListener('click', () => { const collapsed = panel.getAttribute('data-collapsed') === 'true'; panel.setAttribute('data-collapsed', String(!collapsed)); toggle.textContent = collapsed ? '−' : '+'; });
+  }
+  async function fetchFeed(name) {
+    const response = await fetch(`${API_BASE}/api/tec/${name}`, { method: 'GET', cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (!Array.isArray(data.entities)) throw new Error('Format de flux inattendu');
+    return data;
+  }
+  function renderAlerts(data) {
+    const ul = document.getElementById('tec-rt-alert-list'); if (!ul) return;
+    ul.replaceChildren();
+    const entities = (data && data.entities) || [];
+    const items = entities.map(e => e.alert || {}).map(a => {
+      const header = getTranslated(a.header_text) || getTranslated(a.description_text) || getTranslated(a.tts_text);
+      const active = Array.isArray(a.active_period) && a.active_period.length ? a.active_period[0] : null;
+      return { text: header.trim(), start: active && active.start, end: active && active.end };
+    }).filter(x => x.text);
+    if (!items.length) { ul.appendChild(el('li','','Aucun texte d’alerte exploitable dans la réponse actuelle.')); return; }
+    items.slice(0,5).forEach(item => {
+      let text = item.text;
+      if (item.start) text += ` · début ${fmtTime(item.start)}`;
+      if (item.end) text += ` · fin ${fmtTime(item.end)}`;
+      ul.appendChild(el('li','',text));
+    });
+    if (items.length > 5) ul.appendChild(el('li','','… et d’autres entités dans le flux officiel.'));
+  }
+  async function poll(manual = false) {
+    if (state.busy) return; state.busy = true;
+    const summary = document.getElementById('tec-rt-summary'); const dot = document.getElementById('tec-rt-dot');
+    if (summary && manual) summary.textContent = 'Actualisation des flux…';
+    try {
+      const names = ['vehicles','trips','alerts'];
+      const results = await Promise.all(names.map(async name => { try { return [name, await fetchFeed(name), null]; } catch (err) { return [name, null, err]; } }));
+      let success = 0; let firstError = '';
+      for (const [name,data,error] of results) {
+        state.feeds[name] = data ? { ok: true, data } : { ok: false, error: error.message };
+        const counter = document.getElementById(`tec-rt-${name}-count`);
+        if (counter) counter.textContent = data ? String(data.count ?? data.entities.length) : '—';
+        if (data) success++; else if (!firstError) firstError = `${name}: ${error.message}`;
+      }
+      const alertData = state.feeds.alerts && state.feeds.alerts.data;
+      if (alertData) renderAlerts(alertData); else { const ul=document.getElementById('tec-rt-alert-list'); if(ul){ul.replaceChildren();ul.appendChild(el('li','', 'Flux d’alertes indisponible.'));} }
+      if (success === 3) {
+        state.lastOk = new Date(); if (dot) dot.style.background = '#22c55e';
+        if (summary) summary.textContent = `Trois flux accessibles · vérifiés à ${state.lastOk.toLocaleTimeString('fr-BE')}.`;
+      } else if (success > 0) {
+        if (dot) dot.style.background = '#f59e0b';
+        if (summary) summary.textContent = `${success}/3 flux accessibles. ${firstError}`;
+      } else {
+        if (dot) dot.style.background = '#ef4444';
+        if (summary) summary.textContent = `Flux inaccessibles : ${firstError || 'erreur de connexion'}.`;
+      }
+    } catch (err) {
+      if (dot) dot.style.background = '#ef4444';
+      if (summary) summary.textContent = `Erreur de liaison : ${err.message}`;
+    } finally { state.busy = false; }
+  }
+  window.addEventListener('DOMContentLoaded', () => { ensurePanel(); poll(); window.setInterval(() => poll(false), REFRESH_MS); });
+})();
+
+</script>
+
+<script>
+/* GTFS officiel : remplace la génération locale des passages par les horaires du backend TEC. */
+(function(){
+ const OFFICIAL_API='https://controle-tec.onrender.com';
+ const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ function norm(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()}
+ let officialSearchTimer=null;
+ let officialSearchResults=[];
+ const officialStopLookup=new Map();
+ const routeTypeName=t=>({'0':'TRAM','1':'METRO','2':'TRAIN','3':'BUS','4':'FERRY','5':'CABLE','6':'GONDOLA','7':'FUNICULA'})[String(t)]||'TEC';
+ function mapOfficialStop(x){const routes=Array.isArray(x.routes)?x.routes:[];return {id:x.stop_id,name:x.name,lat:typeof x.lat==='number'?x.lat:null,lng:typeof x.lon==='number'?x.lon:null,zone:'Réseau TEC',types:[...new Set(routes.map(r=>routeTypeName(r.route_type)))],lines:[...new Set(routes.map(r=>String(r.short_name||r.long_name||r.route_id)).filter(Boolean))],official:true,parent_station:x.parent_station||null};}
+ window.filterStops=function(){
+   const input=document.getElementById('stop-search-input');const query=(input?.value||'').trim();
+   if(officialSearchTimer)clearTimeout(officialSearchTimer);
+   if(query.length<3){officialSearchResults=[];officialStopLookup.clear();const q=norm(query);renderStopsList(NETWORK_STOPS.filter(s=>!q||norm(s.name).includes(q)||s.lines.some(l=>norm(l).includes(q))));return;}
+   const list=document.getElementById('stops-list');if(list)list.innerHTML='<div class=\"p-4 text-center text-xs text-tec-muted\">Recherche dans le référentiel officiel GTFS TEC…</div>';
+   officialSearchTimer=setTimeout(async()=>{try{const r=await fetch(OFFICIAL_API+'/api/tec/static/stops?q='+encodeURIComponent(query)+'&limit=100',{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.detail||('HTTP '+r.status));officialSearchResults=(d.stops||[]).map(mapOfficialStop);officialStopLookup.clear();officialSearchResults.forEach(x=>officialStopLookup.set(x.id,x));if(officialSearchResults.length)renderStopsList(officialSearchResults);else renderStopsList(NETWORK_STOPS.filter(s=>norm(s.name).includes(norm(query))||s.lines.some(l=>norm(l).includes(norm(query)))));}catch(e){renderStopsList(NETWORK_STOPS.filter(s=>norm(s.name).includes(norm(query))||s.lines.some(l=>norm(l).includes(norm(query)))));const summary=document.getElementById('stops-count');if(summary)summary.title='Recherche GTFS indisponible : '+e.message;}},250);
+ };
+ window.inspectStop=function(stopId){
+   const stop=officialStopLookup.get(String(stopId))||NETWORK_STOPS.find(s=>String(s.id)===String(stopId));if(!stop)return;
+   selectedStopId=stop.id;
+   const title=document.getElementById('selected-stop-title');if(title)title.textContent=stop.name;
+   const subtitle=document.getElementById('selected-stop-subtitle');if(subtitle)subtitle.textContent=(stop.lat==null?'Coordonnées GPS indisponibles':('Coordonnées : '+stop.lat.toFixed(5)+' N, '+stop.lng.toFixed(5)+' E'))+' · '+stop.lines.length+' lignes'+(stop.official?' · Référentiel GTFS officiel':'');
+   const types=document.getElementById('badge-transport-type');if(types)types.textContent=(stop.types||['TEC']).join(' / ');
+   renderStopsList(officialSearchResults.length?officialSearchResults:NETWORK_STOPS);
+   generatePassagesForStop(stop);
+ };
+ window.generatePassagesForStop=async function(stop){
+   const tb=document.getElementById('passages-tbody'); if(!tb)return;
+   tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">Chargement des horaires officiels TEC…</td></tr>';
+   const now=new Date(); const after=String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
+   try{
+     const url=OFFICIAL_API+'/api/tec/static/passages?q='+encodeURIComponent(stop.name)+'&date_str='+encodeURIComponent(now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'))+'&after='+encodeURIComponent(after)+'&limit=12';
+     const response=await fetch(url,{cache:'no-store',headers:{Accept:'application/json'}});
+     const data=await response.json();
+     if(!response.ok)throw new Error(data.detail||('HTTP '+response.status));
+     if(!Array.isArray(data.passages)||!data.passages.length){
+       const candidates=Array.isArray(data.stops)?data.stops:[];
+       const hint=candidates.length>1?'Plusieurs arrêts officiels correspondent à ce nom. Il faudra choisir le bon quai.':(data.message||'Aucun passage restant trouvé pour cet arrêt et cette date dans le GTFS officiel.');
+       tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">'+escapeHtml(hint)+(candidates.length?' '+escapeHtml(candidates.map(x=>x.name).join(' / ')):'')+'</td></tr>';return;
+     }
+     const exact=data.stops&&data.stops.length&&norm(data.stops[0].name)===norm(stop.name);
+     if(data.stops&&data.stops.length>1&&!exact){
+       tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">Plusieurs arrêts officiels correspondent. Vérifie le nom et le quai : '+escapeHtml(data.stops.map(x=>x.name).join(' · '))+'</td></tr>';return;
+     }
+     tb.innerHTML=data.passages.map(p=>{
+       const status=p.realtime_delay_seconds==null?'Théorique':(p.realtime_delay_seconds===0?'À l’heure':(p.realtime_delay_seconds>0?'+'+Math.round(p.realtime_delay_seconds/60)+' min':Math.round(p.realtime_delay_seconds/60)+' min'));
+       return '<tr class="hover:bg-tec-surfaceLight/50">'+
+        '<td class="p-2.5 font-black text-tec-yellow font-mono text-sm">'+escapeHtml(p.line)+'</td>'+
+        '<td class="p-2.5 text-tec-text font-medium">'+escapeHtml(p.destination||'Destination non précisée')+'</td>'+
+        '<td class="p-2.5 font-mono text-tec-text font-bold">'+escapeHtml(p.departure_time)+'</td>'+
+        '<td class="p-2.5 text-tec-muted text-xs">GTFS officiel</td>'+
+        '<td class="p-2.5 text-right"><span class="px-2 py-0.5 rounded text-[11px] font-bold bg-tec-dark text-tec-muted border border-tec-border">'+escapeHtml(status)+'</span></td></tr>';
+     }).join('');
+     const subtitle=document.getElementById('selected-stop-subtitle');
+     if(subtitle)subtitle.textContent='Horaires théoriques officiels · '+data.passages.length+' passages affichés · '+data.date;
+   }catch(err){
+     tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-danger text-xs">Impossible de charger les horaires officiels : '+escapeHtml(err.message)+'. Vérifie le déploiement du backend GTFS.</td></tr>';
+   }
+ };
+})();
+</script>
+
+</body></html>')}
 /* Assistant de recommandation local. Utilise les horaires théoriques déjà chargés dans SCHED/TRIPS. */
 function runControlAdvisor(){
  const out=document.getElementById('ac-results'),summary=document.getElementById('ac-summary');
@@ -1364,5 +1537,69 @@ function geoStart(){if(!navigator.geolocation){gst('Géolocalisation indisponibl
   e=>gst('GPS refusé ou indisponible : '+e.message),{enableHighAccuracy:true,maximumAge:10000});
  setInterval(checkApproach,30000)}
 </script>
+
+<script>
+/* GTFS officiel : remplace la génération locale des passages par les horaires du backend TEC. */
+(function(){
+ const OFFICIAL_API='https://controle-tec.onrender.com';
+ const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ function norm(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()}
+ let officialSearchTimer=null;
+ let officialSearchResults=[];
+ const officialStopLookup=new Map();
+ const routeTypeName=t=>({'0':'TRAM','1':'METRO','2':'TRAIN','3':'BUS','4':'FERRY','5':'CABLE','6':'GONDOLA','7':'FUNICULA'})[String(t)]||'TEC';
+ function mapOfficialStop(x){const routes=Array.isArray(x.routes)?x.routes:[];return {id:x.stop_id,name:x.name,lat:typeof x.lat==='number'?x.lat:null,lng:typeof x.lon==='number'?x.lon:null,zone:'Réseau TEC',types:[...new Set(routes.map(r=>routeTypeName(r.route_type)))],lines:[...new Set(routes.map(r=>String(r.short_name||r.long_name||r.route_id)).filter(Boolean))],official:true,parent_station:x.parent_station||null};}
+ window.filterStops=function(){
+   const input=document.getElementById('stop-search-input');const query=(input?.value||'').trim();
+   if(officialSearchTimer)clearTimeout(officialSearchTimer);
+   if(query.length<3){officialSearchResults=[];officialStopLookup.clear();const q=norm(query);renderStopsList(NETWORK_STOPS.filter(s=>!q||norm(s.name).includes(q)||s.lines.some(l=>norm(l).includes(q))));return;}
+   const list=document.getElementById('stops-list');if(list)list.innerHTML='<div class=\"p-4 text-center text-xs text-tec-muted\">Recherche dans le référentiel officiel GTFS TEC…</div>';
+   officialSearchTimer=setTimeout(async()=>{try{const r=await fetch(OFFICIAL_API+'/api/tec/static/stops?q='+encodeURIComponent(query)+'&limit=100',{cache:'no-store'});const d=await r.json();if(!r.ok)throw new Error(d.detail||('HTTP '+r.status));officialSearchResults=(d.stops||[]).map(mapOfficialStop);officialStopLookup.clear();officialSearchResults.forEach(x=>officialStopLookup.set(x.id,x));if(officialSearchResults.length)renderStopsList(officialSearchResults);else renderStopsList(NETWORK_STOPS.filter(s=>norm(s.name).includes(norm(query))||s.lines.some(l=>norm(l).includes(norm(query)))));}catch(e){renderStopsList(NETWORK_STOPS.filter(s=>norm(s.name).includes(norm(query))||s.lines.some(l=>norm(l).includes(norm(query)))));const summary=document.getElementById('stops-count');if(summary)summary.title='Recherche GTFS indisponible : '+e.message;}},250);
+ };
+ window.inspectStop=function(stopId){
+   const stop=officialStopLookup.get(String(stopId))||NETWORK_STOPS.find(s=>String(s.id)===String(stopId));if(!stop)return;
+   selectedStopId=stop.id;
+   const title=document.getElementById('selected-stop-title');if(title)title.textContent=stop.name;
+   const subtitle=document.getElementById('selected-stop-subtitle');if(subtitle)subtitle.textContent=(stop.lat==null?'Coordonnées GPS indisponibles':('Coordonnées : '+stop.lat.toFixed(5)+' N, '+stop.lng.toFixed(5)+' E'))+' · '+stop.lines.length+' lignes'+(stop.official?' · Référentiel GTFS officiel':'');
+   const types=document.getElementById('badge-transport-type');if(types)types.textContent=(stop.types||['TEC']).join(' / ');
+   renderStopsList(officialSearchResults.length?officialSearchResults:NETWORK_STOPS);
+   generatePassagesForStop(stop);
+ };
+ window.generatePassagesForStop=async function(stop){
+   const tb=document.getElementById('passages-tbody'); if(!tb)return;
+   tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">Chargement des horaires officiels TEC…</td></tr>';
+   const now=new Date(); const after=String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0');
+   try{
+     const url=OFFICIAL_API+'/api/tec/static/passages?q='+encodeURIComponent(stop.name)+'&date_str='+encodeURIComponent(now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0'))+'&after='+encodeURIComponent(after)+'&limit=12';
+     const response=await fetch(url,{cache:'no-store',headers:{Accept:'application/json'}});
+     const data=await response.json();
+     if(!response.ok)throw new Error(data.detail||('HTTP '+response.status));
+     if(!Array.isArray(data.passages)||!data.passages.length){
+       const candidates=Array.isArray(data.stops)?data.stops:[];
+       const hint=candidates.length>1?'Plusieurs arrêts officiels correspondent à ce nom. Il faudra choisir le bon quai.':(data.message||'Aucun passage restant trouvé pour cet arrêt et cette date dans le GTFS officiel.');
+       tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">'+escapeHtml(hint)+(candidates.length?' '+escapeHtml(candidates.map(x=>x.name).join(' / ')):'')+'</td></tr>';return;
+     }
+     const exact=data.stops&&data.stops.length&&norm(data.stops[0].name)===norm(stop.name);
+     if(data.stops&&data.stops.length>1&&!exact){
+       tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-muted text-xs">Plusieurs arrêts officiels correspondent. Vérifie le nom et le quai : '+escapeHtml(data.stops.map(x=>x.name).join(' · '))+'</td></tr>';return;
+     }
+     tb.innerHTML=data.passages.map(p=>{
+       const status=p.realtime_delay_seconds==null?'Théorique':(p.realtime_delay_seconds===0?'À l’heure':(p.realtime_delay_seconds>0?'+'+Math.round(p.realtime_delay_seconds/60)+' min':Math.round(p.realtime_delay_seconds/60)+' min'));
+       return '<tr class="hover:bg-tec-surfaceLight/50">'+
+        '<td class="p-2.5 font-black text-tec-yellow font-mono text-sm">'+escapeHtml(p.line)+'</td>'+
+        '<td class="p-2.5 text-tec-text font-medium">'+escapeHtml(p.destination||'Destination non précisée')+'</td>'+
+        '<td class="p-2.5 font-mono text-tec-text font-bold">'+escapeHtml(p.departure_time)+'</td>'+
+        '<td class="p-2.5 text-tec-muted text-xs">GTFS officiel</td>'+
+        '<td class="p-2.5 text-right"><span class="px-2 py-0.5 rounded text-[11px] font-bold bg-tec-dark text-tec-muted border border-tec-border">'+escapeHtml(status)+'</span></td></tr>';
+     }).join('');
+     const subtitle=document.getElementById('selected-stop-subtitle');
+     if(subtitle)subtitle.textContent='Horaires théoriques officiels · '+data.passages.length+' passages affichés · '+data.date;
+   }catch(err){
+     tb.innerHTML='<tr><td colspan="5" class="p-3 text-tec-danger text-xs">Impossible de charger les horaires officiels : '+escapeHtml(err.message)+'. Vérifie le déploiement du backend GTFS.</td></tr>';
+   }
+ };
+})();
+</script>
+
 </body>
 </html>
