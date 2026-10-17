@@ -1,587 +1,178 @@
-
-import os
+import asyncio
 import csv
-import io
+import os
+import sqlite3
+import tempfile
 import time
-import zipfile
-import logging
 import unicodedata
-from datetime import date, datetime, timedelta
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2
-
+from google.protobuf.json_format import MessageToDict
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tec-service-controle")
+APP_VERSION = "1.4.0-sqlite"
+STATIC_URL_PATH = "/api/gtfs/feed/tec/static"
+STATIC_CACHE_TTL_SECONDS = max(300, int(os.getenv("STATIC_CACHE_TTL_SECONDS", "21600")))
+TMP_DIR = Path(os.getenv("GTFS_TMP_DIR", tempfile.gettempdir()))
+ZIP_PATH = TMP_DIR / "tec_gtfs_static.zip"
+DB_PATH = TMP_DIR / "tec_gtfs_static.sqlite3"
+BUILD_DB_PATH = TMP_DIR / "tec_gtfs_static.building.sqlite3"
+BRUSSELS = ZoneInfo("Europe/Brussels")
+
+app = FastAPI(
+    title="TEC Service Contrôle API",
+    description="Passerelle vers les flux officiels TEC et le référentiel GTFS statique.",
+    version=APP_VERSION,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://roulet4-lang.github.io"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 API_KEY = os.getenv("BM_API_KEY", "").strip()
 API_BASE = os.getenv("BM_API_BASE", "").strip().rstrip("/")
-
-STATIC_API_BASE = os.getenv(
-    "BM_STATIC_API_BASE",
-    "https://opendata-discovery-gtfs-static.api.production.belgianmobility.io",
-).strip().rstrip("/")
-
-STATIC_CACHE_TTL_SECONDS = int(
-    os.getenv("STATIC_CACHE_TTL_SECONDS", "21600")
-)
-
-_static_cache = {"loaded_at": 0.0, "data": None}
-BRUSSELS = ZoneInfo("Europe/Brussels")
-
 FEEDS = {
     "vehicles": "/api/gtfs/feed/tec/rt/vehicle-position",
     "trips": "/api/gtfs/feed/tec/rt/trip-update",
     "alerts": "/api/gtfs/feed/tec/rt/alert",
 }
+_static_lock = asyncio.Lock()
+_static_loaded_at = 0.0
+_static_loaded_iso = None
+_static_counts = None
 
-STATIC_FEED_PATH = "/api/gtfs/feed/tec/static"
-
-app = FastAPI(
-    title="TEC Service Contrôle API",
-    version="1.4.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://roulet4-lang.github.io",
-    ],
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+SOURCE_STATIC = "GTFS statique officiel TEC via Belgian Mobility"
 
 
-# ============================================================
-# OUTILS COMMUNS
-# ============================================================
-
-def require_api_config():
-    if not API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Variable BM_API_KEY absente sur le serveur.",
-        )
-
-    if not API_BASE:
-        raise HTTPException(
-            status_code=500,
-            detail="Variable BM_API_BASE absente sur le serveur.",
-        )
+def normalize_name(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in value).split())
 
 
-def api_headers():
-    return {
-        "Ocp-Apim-Subscription-Key": API_KEY,
-        "Accept": "application/x-protobuf",
-    }
-
-
-def normalize_name(value):
-    value = str(value or "").strip().lower()
-    value = unicodedata.normalize("NFKD", value)
-    return "".join(
-        char for char in value
-        if not unicodedata.combining(char)
-    )
-
-
-def time_seconds(value):
-    """Convertit un horaire GTFS HH:MM:SS en secondes."""
+def time_seconds(value: str) -> int:
     try:
-        parts = str(value).split(":")
-        if len(parts) != 3:
-            return None
-
-        hours, minutes, seconds = map(int, parts)
-        return hours * 3600 + minutes * 60 + seconds
+        h, m, s = (int(part) for part in value.split(":"))
+        return h * 3600 + m * 60 + s
     except (ValueError, TypeError):
-        return None
+        return 0
 
 
-def display_gtfs_time(value):
-    """Conserve les heures GTFS supérieures à 24 h."""
-    seconds = time_seconds(value)
-    if seconds is None:
-        return value
-
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+def display_gtfs_time(value: str) -> str:
+    total = time_seconds(value)
+    days, remainder = divmod(total, 86400)
+    hh, rem = divmod(remainder, 3600)
+    mm = rem // 60
+    return f"{hh:02d}:{mm:02d}" + (f" (+{days} j)" if days else "")
 
 
-def read_csv_from_zip(archive, filename):
-    """Lit un CSV GTFS en UTF-8 avec tolérance aux caractères invalides."""
-    with archive.open(filename) as file:
-        content = file.read().decode("utf-8-sig", errors="replace")
-
-    return list(csv.DictReader(io.StringIO(content)))
+def db_connect(path: Path = DB_PATH) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path), timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
 
 
-def find_gtfs_files(archive):
-    """Indexe les fichiers GTFS même s'ils sont dans un sous-dossier."""
-    result = {}
-
-    for name in archive.namelist():
-        if name.endswith("/"):
-            continue
-
-        basename = name.rsplit("/", 1)[-1].lower()
-
-        if basename.endswith(".txt"):
-            result[basename] = name
-
-    return result
-
-
-def service_active(service_id, service_date, calendars, exceptions):
-    """
-    Détermine si un service GTFS fonctionne à une date donnée.
-    calendar_dates.txt peut ajouter ou supprimer un service.
-    """
-    date_key = service_date.strftime("%Y%m%d")
-
-    exception = exceptions.get((service_id, date_key))
-    if exception is not None:
-        return exception == "1"
-
-    calendar = calendars.get(service_id)
-    if not calendar:
-        return False
-
-    if not (
-        calendar.get("start_date", "") <= date_key
-        <= calendar.get("end_date", "")
-    ):
-        return False
-
-    weekday = service_date.weekday()
-    weekday_fields = [
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-    ]
-
-    return calendar.get(weekday_fields[weekday], "0") == "1"
+def table_exists() -> bool:
+    return DB_PATH.exists() and DB_PATH.stat().st_size > 0
 
 
 # ============================================================
-# FLUX TEMPS RÉEL GTFS-RT
+# TEMPS RÉEL — API GTFS-RT EXISTANTE
 # ============================================================
 
-async def fetch_feed(path):
-    require_api_config()
-
-    url = API_BASE + path
-
+async def fetch_feed(path: str) -> dict:
+    if not API_KEY or not API_BASE:
+        raise HTTPException(status_code=503, detail="Configuration Render incomplète : BM_API_KEY ou BM_API_BASE manquante.")
+    if not API_BASE.startswith("https://"):
+        raise HTTPException(status_code=503, detail="BM_API_BASE doit commencer par https://")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
-                url,
+                API_BASE + path,
                 params={"format": "protobuf"},
-                headers=api_headers(),
+                headers={"Ocp-Apim-Subscription-Key": API_KEY, "Accept": "application/x-protobuf"},
             )
-
-        if response.status_code in (401, 403):
-            raise HTTPException(
-                status_code=response.status_code,
-                detail="Accès refusé par l'API de mobilité. Vérifier la clé API.",
-            )
-
-        if response.status_code == 404:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Flux temps réel introuvable : {path}",
-            )
-
-        if response.status_code == 429:
-            raise HTTPException(
-                status_code=429,
-                detail="Limite de requêtes de l'API atteinte.",
-            )
-
-        response.raise_for_status()
-
-        feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(response.content)
-
-        timestamp = None
-        if feed.header.HasField("timestamp"):
-            timestamp = str(feed.header.timestamp)
-
-        return {
-            "ok": True,
-            "count": len(feed.entity),
-            "feed_timestamp": timestamp,
-            "entities": [
-                entity.SerializeToString().hex()
-                for entity in feed.entity
-            ],
-        }
-
-    except HTTPException:
-        raise
     except httpx.TimeoutException:
-        logger.exception("Délai dépassé sur le flux %s", path)
-        raise HTTPException(
-            status_code=504,
-            detail=f"Le flux temps réel a dépassé le délai autorisé : {path}",
-        )
-    except httpx.HTTPStatusError as exc:
-        logger.error(
-            "Erreur HTTP flux %s : statut=%s",
-            path,
-            exc.response.status_code,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur HTTP du fournisseur sur le flux {path}.",
-        )
-    except Exception as exc:
-        logger.exception("Erreur flux temps réel %s", path)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Impossible de lire le flux {path} ({type(exc).__name__}).",
-        )
+        raise HTTPException(status_code=504, detail="Délai dépassé lors de la connexion à Belgian Mobility.")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur réseau vers Belgian Mobility : {type(exc).__name__}.")
 
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=502, detail=f"Accès refusé par Belgian Mobility (HTTP {response.status_code}). Vérifie l'abonnement, la clé et les autorisations.")
+    if response.status_code == 404:
+        raise HTTPException(status_code=502, detail=f"Endpoint introuvable (HTTP 404) : {path}. Vérifie l'URL de base, le chemin et les paramètres dans le portail Belgian Mobility.")
+    if response.status_code == 429:
+        raise HTTPException(status_code=503, detail="Limite de requêtes Belgian Mobility atteinte.")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Belgian Mobility a répondu HTTP {response.status_code} pour {path}.")
 
-# ============================================================
-# TÉLÉCHARGEMENT ET ANALYSE DU GTFS STATIQUE
-# ============================================================
-
-async def load_static_gtfs(force_refresh=False):
-    now = time.time()
-
-    if (
-        not force_refresh
-        and _static_cache["data"] is not None
-        and now - _static_cache["loaded_at"] < STATIC_CACHE_TTL_SECONDS
-    ):
-        return _static_cache["data"]
-
-    require_api_config()
-
-    url = STATIC_API_BASE + STATIC_FEED_PATH
-    headers = {
-        "Ocp-Apim-Subscription-Key": API_KEY,
-        "Accept": "application/zip, application/octet-stream",
+    feed = gtfs_realtime_pb2.FeedMessage()
+    try:
+        feed.ParseFromString(response.content)
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Réponse reçue pour {path}, mais impossible de la décoder en GTFS-Realtime protobuf.")
+    data = MessageToDict(feed, preserving_proto_field_name=True, use_integers_for_enums=True)
+    header = data.get("header", {})
+    entities = data.get("entity", [])
+    return {
+        "source": "Belgian Mobility / TEC",
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "feed_timestamp": header.get("timestamp"),
+        "feed_version": header.get("gtfs_realtime_version"),
+        "incrementality": header.get("incrementality"),
+        "count": len(entities),
+        "entities": entities,
     }
 
-    logger.info("Téléchargement GTFS statique depuis %s", STATIC_API_BASE)
-    started = time.monotonic()
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=20.0),
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url, headers=headers)
-
-        logger.info(
-            "Réponse GTFS statique : status=%s, content_type=%s, "
-            "taille=%s octets, durée=%.2fs",
-            response.status_code,
-            response.headers.get("content-type", "inconnu"),
-            len(response.content),
-            time.monotonic() - started,
-        )
-
-        if response.status_code in (401, 403):
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=(
-                    "Accès refusé au GTFS statique. Vérifier la clé API "
-                    "et les droits associés."
-                ),
-            )
-
-        if response.status_code == 404:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Endpoint GTFS statique introuvable : {url}",
-            )
-
-        if response.status_code == 429:
-            raise HTTPException(
-                status_code=429,
-                detail="Limite de requêtes atteinte sur le GTFS statique.",
-            )
-
-        if response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Erreur HTTP du fournisseur GTFS statique : "
-                    f"statut {response.status_code}."
-                ),
-            )
-
-        if not response.content:
-            raise HTTPException(
-                status_code=502,
-                detail="Le fournisseur a renvoyé un fichier GTFS vide.",
-            )
-
-        try:
-            archive = zipfile.ZipFile(io.BytesIO(response.content))
-        except zipfile.BadZipFile:
-            content_type = response.headers.get("content-type", "inconnu")
-            logger.error(
-                "Le contenu reçu n'est pas un ZIP. content_type=%s",
-                content_type,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Le fournisseur n'a pas renvoyé un ZIP GTFS valide. "
-                    f"Type de contenu reçu : {content_type}."
-                ),
-            )
-
-        with archive:
-            files = find_gtfs_files(archive)
-
-            required = [
-                "stops.txt",
-                "routes.txt",
-                "trips.txt",
-                "stop_times.txt",
-            ]
-
-            missing = [name for name in required if name not in files]
-
-            if missing:
-                logger.error(
-                    "Fichiers GTFS absents : %s. Fichiers trouvés : %s",
-                    missing,
-                    list(files.keys()),
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "Le ZIP GTFS ne contient pas les fichiers requis : "
-                        + ", ".join(missing)
-                    ),
-                )
-
-            stops_rows = read_csv_from_zip(archive, files["stops.txt"])
-            routes_rows = read_csv_from_zip(archive, files["routes.txt"])
-            trips_rows = read_csv_from_zip(archive, files["trips.txt"])
-            stop_times_rows = read_csv_from_zip(
-                archive, files["stop_times.txt"]
-            )
-
-            calendars = {}
-            exceptions = {}
-
-            if "calendar.txt" in files:
-                for row in read_csv_from_zip(
-                    archive, files["calendar.txt"]
-                ):
-                    calendars[row.get("service_id", "")] = row
-
-            if "calendar_dates.txt" in files:
-                for row in read_csv_from_zip(
-                    archive, files["calendar_dates.txt"]
-                ):
-                    exceptions[
-                        (
-                            row.get("service_id", ""),
-                            row.get("date", ""),
-                        )
-                    ] = row.get("exception_type", "")
-
-            stops = {
-                row.get("stop_id", ""): row
-                for row in stops_rows
-                if row.get("stop_id")
-            }
-
-            routes = {
-                row.get("route_id", ""): row
-                for row in routes_rows
-                if row.get("route_id")
-            }
-
-            trips = {
-                row.get("trip_id", ""): row
-                for row in trips_rows
-                if row.get("trip_id")
-            }
-
-            by_stop = {}
-
-            for row in stop_times_rows:
-                stop_id = row.get("stop_id", "")
-                trip_id = row.get("trip_id", "")
-
-                if not stop_id or not trip_id:
-                    continue
-
-                trip = trips.get(trip_id)
-                if not trip:
-                    continue
-
-                route_id = trip.get("route_id", "")
-                route = routes.get(route_id, {})
-
-                passage = {
-                    "stop_id": stop_id,
-                    "stop_name": stops.get(stop_id, {}).get(
-                        "stop_name", ""
-                    ),
-                    "trip_id": trip_id,
-                    "route_id": route_id,
-                    "route_short_name": route.get(
-                        "route_short_name", ""
-                    ),
-                    "route_long_name": route.get(
-                        "route_long_name", ""
-                    ),
-                    "service_id": trip.get("service_id", ""),
-                    "trip_headsign": trip.get("trip_headsign", ""),
-                    "direction_id": trip.get("direction_id", ""),
-                    "stop_sequence": row.get("stop_sequence", ""),
-                    "arrival_time": display_gtfs_time(
-                        row.get("arrival_time", "")
-                    ),
-                    "departure_time": display_gtfs_time(
-                        row.get("departure_time", "")
-                    ),
-                    "_departure_seconds": time_seconds(
-                        row.get("departure_time", "")
-                    ),
-                }
-
-                by_stop.setdefault(stop_id, []).append(passage)
-
-            for passages in by_stop.values():
-                passages.sort(
-                    key=lambda item: (
-                        item["_departure_seconds"]
-                        if item["_departure_seconds"] is not None
-                        else 10**12
-                    )
-                )
-
-            data = {
-                "source": "GTFS statique",
-                "loaded_at": datetime.now(BRUSSELS).isoformat(),
-                "stops": stops,
-                "routes": routes,
-                "trips": trips,
-                "by_stop": by_stop,
-                "calendars": calendars,
-                "exceptions": exceptions,
-            }
-
-        _static_cache["data"] = data
-        _static_cache["loaded_at"] = time.time()
-
-        logger.info(
-            "GTFS statique chargé en %.2fs : %s arrêts, %s lignes, "
-            "%s voyages, %s arrêts-horaires",
-            time.monotonic() - started,
-            len(data["stops"]),
-            len(data["routes"]),
-            len(data["trips"]),
-            sum(len(items) for items in data["by_stop"].values()),
-        )
-
-        return data
-
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        logger.exception("Délai dépassé pendant le téléchargement GTFS")
-        raise HTTPException(
-            status_code=504,
-            detail="Le téléchargement du GTFS statique a dépassé 120 secondes.",
-        )
-    except httpx.HTTPError as exc:
-        logger.exception("Erreur réseau GTFS statique")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur réseau GTFS statique ({type(exc).__name__}).",
-        )
-    except Exception as exc:
-        logger.exception("Échec de chargement ou d'analyse du GTFS statique")
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Le GTFS statique n'a pas pu être analysé "
-                f"({type(exc).__name__}). Consulter les logs du serveur."
-            ),
-        )
-
-
-# ============================================================
-# ROUTES GÉNÉRALES
-# ============================================================
 
 @app.get("/")
-async def root():
+def home():
     return {
         "service": "TEC Service Contrôle API",
-        "version": app.version,
+        "version": APP_VERSION,
         "status": "online",
-        "realtime_feeds": list(FEEDS.keys()),
-        "static_endpoints": [
-            "/api/tec/static/summary",
-            "/api/tec/static/stops",
-            "/api/tec/static/passages",
-        ],
+        "health": "/health",
+        "docs": "/docs",
+        "connection_test": "/api/tec/connection-test",
+        "static_summary": "/api/tec/static/summary",
     }
 
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "status": "online"}
+def health():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "api_key_configured": bool(API_KEY),
+        "api_base_configured": bool(API_BASE),
+        "static_database_exists": table_exists(),
+        "static_database_bytes": DB_PATH.stat().st_size if table_exists() else 0,
+    }
 
 
 @app.get("/api/tec/connection-test")
 async def connection_test():
     results = {}
-
     for name, path in FEEDS.items():
         try:
-            result = await fetch_feed(path)
-            results[name] = {
-                "ok": True,
-                "count": result["count"],
-                "feed_timestamp": result["feed_timestamp"],
-            }
+            data = await fetch_feed(path)
+            results[name] = {"ok": True, "count": data["count"], "feed_timestamp": data["feed_timestamp"]}
         except HTTPException as exc:
-            results[name] = {
-                "ok": False,
-                "status_code": exc.status_code,
-                "error": exc.detail,
-            }
+            results[name] = {"ok": False, "error": exc.detail}
+    return {"all_ok": all(item["ok"] for item in results.values()), "checked_at": datetime.now(timezone.utc).isoformat(), "feeds": results}
 
-    return {
-        "all_ok": all(item["ok"] for item in results.values()),
-        "checked_at": datetime.now(BRUSSELS).isoformat(),
-        "feeds": results,
-    }
-
-
-# ============================================================
-# ROUTES TEMPS RÉEL
-# ============================================================
 
 @app.get("/api/tec/vehicles")
 async def vehicles():
@@ -599,159 +190,394 @@ async def alerts():
 
 
 # ============================================================
-# ROUTES GTFS STATIQUE
+# GTFS STATIQUE — TÉLÉCHARGEMENT EN FLUX + SQLITE (RAM LIMITÉE)
 # ============================================================
+
+def _download_and_build_db(zip_path: Path, build_path: Path) -> dict:
+    """Parse le ZIP en streaming dans SQLite : aucune table GTFS complète en RAM."""
+    if build_path.exists():
+        build_path.unlink()
+    if not zip_path.exists():
+        raise RuntimeError("Archive GTFS temporaire introuvable")
+
+    con = sqlite3.connect(str(build_path), timeout=60)
+    try:
+        con.execute("PRAGMA journal_mode=OFF")
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("PRAGMA temp_store=FILE")
+        con.execute("PRAGMA cache_size=-8000")  # environ 8 Mo de cache SQLite
+        con.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE routes (
+                route_id TEXT PRIMARY KEY, short_name TEXT NOT NULL, long_name TEXT NOT NULL, route_type TEXT NOT NULL
+            );
+            CREATE TABLE trips (
+                trip_id TEXT PRIMARY KEY, route_id TEXT NOT NULL, service_id TEXT NOT NULL,
+                headsign TEXT NOT NULL, direction_id TEXT NOT NULL
+            );
+            CREATE TABLE stops (
+                stop_id TEXT PRIMARY KEY, name TEXT NOT NULL, name_norm TEXT NOT NULL,
+                lat REAL, lon REAL, parent_station TEXT
+            );
+            CREATE TABLE calendars (
+                service_id TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+                monday INTEGER, tuesday INTEGER, wednesday INTEGER, thursday INTEGER,
+                friday INTEGER, saturday INTEGER, sunday INTEGER
+            );
+            CREATE TABLE calendar_dates (
+                service_id TEXT NOT NULL, service_date TEXT NOT NULL, exception_type INTEGER NOT NULL,
+                PRIMARY KEY(service_id, service_date)
+            );
+            CREATE TABLE stop_times (
+                stop_id TEXT NOT NULL, trip_id TEXT NOT NULL, service_id TEXT NOT NULL,
+                route_id TEXT NOT NULL, arrival_time TEXT NOT NULL, departure_time TEXT NOT NULL,
+                departure_seconds INTEGER NOT NULL, stop_sequence INTEGER NOT NULL
+            );
+            CREATE TABLE raw_stop_times (
+                stop_id TEXT NOT NULL, trip_id TEXT NOT NULL, arrival_time TEXT NOT NULL,
+                departure_time TEXT NOT NULL, stop_sequence INTEGER NOT NULL
+            );
+        """)
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            filemap = {}
+            for member in archive.namelist():
+                base = member.rsplit("/", 1)[-1]
+                if base.endswith(".txt") and base not in filemap:
+                    filemap[base] = member
+            required = {"stops.txt", "routes.txt", "trips.txt", "stop_times.txt"}
+            if not required.issubset(filemap):
+                raise ValueError("fichiers GTFS obligatoires absents : " + ", ".join(sorted(required - set(filemap))))
+
+            def rows(filename):
+                with archive.open(filemap[filename], "r") as raw:
+                    import io
+                    with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as text_stream:
+                        yield from csv.DictReader(text_stream)
+
+            # Tables de référence : insertion par lots.
+            batch = []
+            for row in rows("routes.txt"):
+                rid = (row.get("route_id") or "").strip()
+                if rid:
+                    batch.append((rid, (row.get("route_short_name") or "").strip(), (row.get("route_long_name") or "").strip(), (row.get("route_type") or "").strip()))
+                if len(batch) >= 2000:
+                    con.executemany("INSERT OR REPLACE INTO routes VALUES (?,?,?,?)", batch); batch.clear()
+            if batch: con.executemany("INSERT OR REPLACE INTO routes VALUES (?,?,?,?)", batch)
+            con.commit()
+
+            batch = []
+            for row in rows("trips.txt"):
+                tid, rid = (row.get("trip_id") or "").strip(), (row.get("route_id") or "").strip()
+                if tid and rid:
+                    batch.append((tid, rid, (row.get("service_id") or "").strip(), (row.get("trip_headsign") or "").strip(), (row.get("direction_id") or "").strip()))
+                if len(batch) >= 2000:
+                    con.executemany("INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?)", batch); batch.clear()
+            if batch: con.executemany("INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?)", batch)
+            con.commit()
+
+            batch = []
+            for row in rows("stops.txt"):
+                sid = (row.get("stop_id") or "").strip()
+                if not sid: continue
+                try:
+                    lat = float(row.get("stop_lat") or "")
+                    lon = float(row.get("stop_lon") or "")
+                except (TypeError, ValueError):
+                    lat = lon = None
+                name = (row.get("stop_name") or "").strip()
+                batch.append((sid, name, normalize_name(name), lat, lon, (row.get("parent_station") or "").strip() or None))
+                if len(batch) >= 2000:
+                    con.executemany("INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?)", batch); batch.clear()
+            if batch: con.executemany("INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?,?)", batch)
+            con.commit()
+
+            if "calendar.txt" in filemap:
+                batch = []
+                for row in rows("calendar.txt"):
+                    sid = (row.get("service_id") or "").strip()
+                    if not sid: continue
+                    try:
+                        start = datetime.strptime(row.get("start_date", ""), "%Y%m%d").date().isoformat()
+                        end = datetime.strptime(row.get("end_date", ""), "%Y%m%d").date().isoformat()
+                    except ValueError:
+                        continue
+                    days = [1 if row.get(k) == "1" else 0 for k in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")]
+                    batch.append((sid, start, end, *days))
+                    if len(batch) >= 2000:
+                        con.executemany("INSERT OR REPLACE INTO calendars VALUES (?,?,?,?,?,?,?,?,?,?)", batch); batch.clear()
+                if batch: con.executemany("INSERT OR REPLACE INTO calendars VALUES (?,?,?,?,?,?,?,?,?,?)", batch)
+                con.commit()
+
+            if "calendar_dates.txt" in filemap:
+                batch = []
+                for row in rows("calendar_dates.txt"):
+                    sid = (row.get("service_id") or "").strip()
+                    try:
+                        d = datetime.strptime(row.get("date", ""), "%Y%m%d").date().isoformat()
+                        typ = int(row.get("exception_type", "0"))
+                    except ValueError:
+                        continue
+                    if sid: batch.append((sid, d, typ))
+                    if len(batch) >= 2000:
+                        con.executemany("INSERT OR REPLACE INTO calendar_dates VALUES (?,?,?)", batch); batch.clear()
+                if batch: con.executemany("INSERT OR REPLACE INTO calendar_dates VALUES (?,?,?)", batch)
+                con.commit()
+
+            # stop_times est le fichier volumineux : import brut en lots, sans requête SQL par ligne.
+            batch = []
+            for row in rows("stop_times.txt"):
+                sid, tid = (row.get("stop_id") or "").strip(), (row.get("trip_id") or "").strip()
+                if not sid or not tid: continue
+                dep = (row.get("departure_time") or row.get("arrival_time") or "").strip()
+                arr = (row.get("arrival_time") or dep).strip()
+                if not dep: continue
+                try: seq = int(row.get("stop_sequence") or 0)
+                except ValueError: seq = 0
+                batch.append((sid, tid, arr, dep, seq))
+                if len(batch) >= 5000:
+                    con.executemany("INSERT INTO raw_stop_times VALUES (?,?,?,?,?)", batch); batch.clear()
+            if batch: con.executemany("INSERT INTO raw_stop_times VALUES (?,?,?,?,?)", batch)
+            con.commit()
+
+            # Jointure SQL en bloc : beaucoup plus rapide et moins gourmande que des millions de SELECT Python.
+            con.create_function("gtfs_seconds", 1, time_seconds, deterministic=True)
+            con.execute("""INSERT INTO stop_times
+                (stop_id, trip_id, service_id, route_id, arrival_time, departure_time, departure_seconds, stop_sequence)
+                SELECT raw.stop_id, raw.trip_id, trips.service_id, trips.route_id, raw.arrival_time, raw.departure_time,
+                       gtfs_seconds(raw.departure_time), raw.stop_sequence
+                FROM raw_stop_times raw
+                JOIN trips ON trips.trip_id=raw.trip_id
+                JOIN stops ON stops.stop_id=raw.stop_id
+                WHERE trips.route_id IS NOT NULL""")
+            con.commit()
+            con.execute("DROP TABLE raw_stop_times")
+            con.commit()
+
+        # Index construits après l'import pour accélérer l'insertion sur petit serveur.
+        con.executescript("""
+            CREATE INDEX idx_stoptimes_stop ON stop_times(stop_id, departure_seconds);
+            CREATE INDEX idx_stoptimes_trip ON stop_times(trip_id);
+            CREATE INDEX idx_stoptimes_service ON stop_times(service_id);
+            CREATE INDEX idx_stops_name_norm ON stops(name_norm);
+            CREATE INDEX idx_calendar_dates_date ON calendar_dates(service_date, service_id);
+            CREATE INDEX idx_trips_route ON trips(route_id);
+            CREATE TABLE stop_routes AS SELECT DISTINCT stop_id, route_id FROM stop_times;
+            CREATE INDEX idx_stop_routes_stop ON stop_routes(stop_id, route_id);
+        """)
+        counts = {
+            "stops": con.execute("SELECT COUNT(*) FROM stops").fetchone()[0],
+            "routes": con.execute("SELECT COUNT(*) FROM routes").fetchone()[0],
+            "trips": con.execute("SELECT COUNT(*) FROM trips").fetchone()[0],
+            "stop_times": con.execute("SELECT COUNT(*) FROM stop_times").fetchone()[0],
+        }
+        loaded_iso = datetime.now(timezone.utc).isoformat()
+        con.executemany("INSERT INTO meta(key,value) VALUES (?,?)", [("loaded_at", loaded_iso), ("source", SOURCE_STATIC)])
+        con.commit()
+        con.execute("PRAGMA optimize")
+        return {"counts": counts, "loaded_at": loaded_iso}
+    finally:
+        con.close()
+
+
+async def load_static_gtfs(force_refresh: bool = False) -> dict:
+    """Assure que la base SQLite existe; verrou empêche plusieurs imports simultanés."""
+    global _static_loaded_at, _static_loaded_iso, _static_counts
+    now = time.time()
+    if table_exists() and not force_refresh and now - _static_loaded_at < STATIC_CACHE_TTL_SECONDS:
+        return {"source": SOURCE_STATIC, "loaded_at": _static_loaded_iso or "unknown", "counts": _static_counts or _read_counts()}
+
+    async with _static_lock:
+        now = time.time()
+        if table_exists() and not force_refresh and now - _static_loaded_at < STATIC_CACHE_TTL_SECONDS:
+            return {"source": SOURCE_STATIC, "loaded_at": _static_loaded_iso or "unknown", "counts": _static_counts or _read_counts()}
+        if not API_KEY or not API_BASE:
+            raise HTTPException(status_code=503, detail="Configuration Render incomplète : BM_API_KEY ou BM_API_BASE manquante.")
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        try:
+            # Téléchargement en chunks vers disque : response.content ne garde pas 94 Mo en RAM.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0), follow_redirects=True) as client:
+                async with client.stream("GET", API_BASE + STATIC_URL_PATH, headers={"Ocp-Apim-Subscription-Key": API_KEY, "Accept": "application/zip, application/octet-stream"}) as response:
+                    if response.status_code in (401, 403):
+                        raise HTTPException(status_code=502, detail="Accès refusé au GTFS statique par Belgian Mobility. Vérifie les droits de la clé API.")
+                    if response.status_code >= 400:
+                        raise HTTPException(status_code=502, detail=f"Belgian Mobility a répondu HTTP {response.status_code} pour le GTFS statique.")
+                    with open(ZIP_PATH, "wb") as out:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            if chunk: out.write(chunk)
+            print(f"GTFS statique téléchargé : {ZIP_PATH.stat().st_size} octets en {time.time()-started:.1f}s")
+            # Import synchrone vers SQLite : aucune accumulation des stop_times en mémoire.
+            info = await asyncio.to_thread(_download_and_build_db, ZIP_PATH, BUILD_DB_PATH)
+            # Remplacement atomique de la base uniquement après import réussi.
+            os.replace(BUILD_DB_PATH, DB_PATH)
+            # L'archive n'est plus utile après l'import : libère l'espace disque temporaire.
+            try:
+                ZIP_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _static_loaded_at = time.time()
+            _static_loaded_iso = info["loaded_at"]
+            _static_counts = info["counts"]
+            print(f"GTFS SQLite prêt : {info['counts']} ; base={DB_PATH.stat().st_size} octets ; durée totale={time.time()-started:.1f}s")
+            return {"source": SOURCE_STATIC, **info}
+        except HTTPException:
+            raise
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Délai dépassé lors du téléchargement GTFS statique.")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur réseau lors du téléchargement GTFS statique : {type(exc).__name__}.")
+        except Exception as exc:
+            print(f"Erreur import GTFS SQLite : {type(exc).__name__}: {exc}")
+            if BUILD_DB_PATH.exists():
+                try: BUILD_DB_PATH.unlink()
+                except OSError: pass
+            try:
+                ZIP_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(status_code=502, detail=f"Le GTFS statique n'a pas pu être importé dans SQLite ({type(exc).__name__}). Consulte les logs Render.")
+
+
+def _read_counts() -> dict:
+    if not table_exists(): return {"stops": 0, "routes": 0, "trips": 0, "stop_times": 0}
+    try:
+        with db_connect() as con:
+            return {name: con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for name, table in [("stops", "stops"), ("routes", "routes"), ("trips", "trips"), ("stop_times", "stop_times")]}
+    except sqlite3.Error:
+        return {"stops": 0, "routes": 0, "trips": 0, "stop_times": 0}
+
+
+def _route_objects_for_stops(con: sqlite3.Connection, stop_ids: list[str]) -> dict:
+    result = {sid: [] for sid in stop_ids}
+    if not stop_ids: return result
+    # Groupes de paramètres limités pour respecter la limite SQLite.
+    for offset in range(0, len(stop_ids), 500):
+        chunk = stop_ids[offset:offset+500]
+        placeholders = ",".join("?" for _ in chunk)
+        query = f"""SELECT sr.stop_id, r.route_id, r.short_name, r.long_name, r.route_type
+                    FROM stop_routes sr JOIN routes r ON r.route_id=sr.route_id
+                    WHERE sr.stop_id IN ({placeholders}) ORDER BY sr.stop_id, r.route_id"""
+        for row in con.execute(query, chunk):
+            result[row["stop_id"]].append({"route_id": row["route_id"], "short_name": row["short_name"], "long_name": row["long_name"], "route_type": row["route_type"]})
+    return result
+
+
+def _stop_objects(con: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
+    ids = [r["stop_id"] for r in rows]
+    route_map = _route_objects_for_stops(con, ids)
+    output = []
+    for row in rows:
+        routes = route_map.get(row["stop_id"], [])
+        output.append({
+            "stop_id": row["stop_id"], "name": row["name"], "lat": row["lat"], "lon": row["lon"],
+            "parent_station": row["parent_station"], "routes": routes,
+            "route_ids": [r["route_id"] for r in routes],
+        })
+    return output
+
+
+def _service_is_active(con: sqlite3.Connection, service_id: str, service_date: date) -> bool:
+    ds = service_date.isoformat()
+    exception = con.execute("SELECT exception_type FROM calendar_dates WHERE service_id=? AND service_date=?", (service_id, ds)).fetchone()
+    if exception:
+        return exception[0] == 1
+    cal = con.execute("SELECT * FROM calendars WHERE service_id=?", (service_id,)).fetchone()
+    if not cal or not (cal["start_date"] <= ds <= cal["end_date"]):
+        return False
+    keys = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    return bool(cal[keys[service_date.weekday()]])
+
 
 @app.get("/api/tec/static/summary")
 async def static_summary(refresh: bool = False):
     data = await load_static_gtfs(force_refresh=refresh)
-
-    return {
-        "ok": True,
-        "source": data["source"],
-        "loaded_at": data["loaded_at"],
-        "counts": {
-            "stops": len(data["stops"]),
-            "routes": len(data["routes"]),
-            "trips": len(data["trips"]),
-            "stops_with_passages": len(data["by_stop"]),
-            "calendar_services": len(data["calendars"]),
-            "calendar_exceptions": len(data["exceptions"]),
-        },
-    }
+    return {"source": data["source"], "loaded_at": data["loaded_at"], "counts": data["counts"]}
 
 
 @app.get("/api/tec/static/stops")
-async def static_stops(
-    q: str = "",
-    limit: int = Query(default=100, ge=1, le=20000),
-):
+async def static_stops(q: str = "", limit: int = 5000):
     data = await load_static_gtfs()
-    query = normalize_name(q)
-
-    results = []
-
-    for stop_id, stop in data["stops"].items():
-        name = stop.get("stop_name", "")
-
-        if query and query not in normalize_name(name) and query not in normalize_name(stop_id):
-            continue
-
-        results.append({
-            "stop_id": stop_id,
-            "stop_name": name,
-            "stop_code": stop.get("stop_code", ""),
-            "stop_desc": stop.get("stop_desc", ""),
-            "stop_lat": stop.get("stop_lat", ""),
-            "stop_lon": stop.get("stop_lon", ""),
-            "location_type": stop.get("location_type", ""),
-            "parent_station": stop.get("parent_station", ""),
-            "wheelchair_boarding": stop.get("wheelchair_boarding", ""),
-        })
-
-        if len(results) >= limit:
-            break
-
-    return {
-        "ok": True,
-        "count": len(results),
-        "stops": results,
-    }
+    limit = max(1, min(limit, 20000))
+    needle = normalize_name(q)
+    with db_connect() as con:
+        if needle:
+            rows = con.execute("SELECT * FROM stops WHERE name_norm LIKE ? OR lower(stop_id) LIKE ? ORDER BY name_norm, stop_id LIMIT ?", (f"%{needle}%", f"%{q.strip().lower()}%", limit)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM stops ORDER BY name_norm, stop_id LIMIT ?", (limit,)).fetchall()
+        stops = _stop_objects(con, rows)
+    return {"source": data["source"], "loaded_at": data["loaded_at"], "count": len(stops), "stops": stops}
 
 
 @app.get("/api/tec/static/passages")
-async def static_passages(
-    stop_id: str = "",
-    q: str = "",
-    date_str: str = "",
-    after: str = "",
-    limit: int = Query(default=100, ge=1, le=2000),
-):
+async def static_passages(q: str = "", stop_id: str = "", date_str: str = "", after: str = "", limit: int = 12):
+    """Passages théoriques du GTFS officiel, filtrés avec le calendrier de service."""
     data = await load_static_gtfs()
-
-    if not stop_id and not q:
-        raise HTTPException(
-            status_code=400,
-            detail="Fournir stop_id ou q pour rechercher un arrêt.",
-        )
-
-    if date_str:
+    local_now = datetime.now(BRUSSELS)
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else local_now.date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date_str doit être au format AAAA-MM-JJ.")
+    after_seconds = None
+    if after:
         try:
-            service_date = date.fromisoformat(date_str)
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="date_str doit respecter le format AAAA-MM-JJ.",
-            )
-    else:
-        service_date = datetime.now(BRUSSELS).date()
+            parts = after.split(":")
+            if len(parts) not in (2, 3): raise ValueError
+            after_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + (int(parts[2]) if len(parts) == 3 else 0)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="after doit être au format HH:MM ou HH:MM:SS.")
+    limit = max(1, min(limit, 100))
 
-    query = normalize_name(q)
+    with db_connect() as con:
+        if stop_id:
+            candidate_rows = con.execute("SELECT * FROM stops WHERE stop_id=?", (stop_id,)).fetchall()
+        elif q.strip():
+            needle = normalize_name(q)
+            candidate_rows = con.execute("SELECT * FROM stops WHERE name_norm=? ORDER BY stop_id LIMIT 10", (needle,)).fetchall()
+            if not candidate_rows:
+                candidate_rows = con.execute("SELECT * FROM stops WHERE name_norm LIKE ? ORDER BY name_norm, stop_id LIMIT 10", (f"%{needle}%",)).fetchall()
+        else:
+            raise HTTPException(status_code=400, detail="Fournis stop_id ou q avec le nom de l'arrêt.")
 
-    matching_stop_ids = []
+        if not candidate_rows:
+            return {"source": data["source"], "date": target_date.isoformat(), "count": 0, "stops": [], "passages": [], "message": "Aucun arrêt officiel correspondant. Essaie un nom plus court."}
 
-    if stop_id:
-        if stop_id in data["stops"]:
-            matching_stop_ids = [stop_id]
-    else:
-        for sid, stop in data["stops"].items():
-            if query in normalize_name(stop.get("stop_name", "")):
-                matching_stop_ids.append(sid)
-
-    if not matching_stop_ids:
+        candidates = _stop_objects(con, candidate_rows)
+        passages = []
+        for stop in candidates:
+            sid = stop["stop_id"]
+            rows = con.execute("""SELECT st.*, t.headsign, r.short_name, r.long_name
+                                 FROM stop_times st
+                                 LEFT JOIN trips t ON t.trip_id=st.trip_id
+                                 LEFT JOIN routes r ON r.route_id=st.route_id
+                                 WHERE st.stop_id=? ORDER BY st.departure_seconds, r.short_name LIMIT 20000""", (sid,)).fetchall()
+            for item in rows:
+                raw_seconds = item["departure_seconds"]
+                if raw_seconds >= 86400:
+                    service_date = target_date - timedelta(days=1)
+                    dep_seconds = raw_seconds - 86400
+                    if after_seconds is not None and after_seconds >= 6 * 3600:
+                        continue
+                else:
+                    service_date = target_date
+                    dep_seconds = raw_seconds
+                if not _service_is_active(con, item["service_id"], service_date):
+                    continue
+                if after_seconds is not None and dep_seconds < after_seconds:
+                    continue
+                line = item["short_name"] or item["long_name"] or item["route_id"]
+                passages.append({
+                    "stop_id": sid, "stop_name": stop["name"], "trip_id": item["trip_id"],
+                    "service_id": item["service_id"], "route_id": item["route_id"], "line": line,
+                    "destination": item["headsign"] or item["long_name"] or "Destination non précisée",
+                    "arrival_time": display_gtfs_time(item["arrival_time"]),
+                    "departure_time": display_gtfs_time(str(dep_seconds // 3600).zfill(2) + ":" + str((dep_seconds % 3600) // 60).zfill(2) + ":" + str(dep_seconds % 60).zfill(2)),
+                    "departure_seconds": dep_seconds, "status": "Horaire théorique GTFS", "realtime_delay_seconds": None,
+                })
+        passages.sort(key=lambda x: (x["departure_seconds"], str(x["line"])))
         return {
-            "ok": True,
-            "date": service_date.isoformat(),
-            "count": 0,
-            "passages": [],
+            "source": data["source"], "loaded_at": data["loaded_at"], "date": target_date.isoformat(),
+            "count": min(len(passages), limit), "stops": candidates, "passages": passages[:limit],
             "realtime_join": "not_applied",
+            "note": "Horaires théoriques officiels. Les retards en temps réel ne sont pas indiqués tant que la correspondance des identifiants GTFS-RT n'est pas confirmée.",
         }
-
-    after_seconds = time_seconds(after) if after else None
-    results = []
-
-    for sid in matching_stop_ids:
-        for passage in data["by_stop"].get(sid, []):
-            service_id = passage.get("service_id", "")
-
-            if not service_active(
-                service_id,
-                service_date,
-                data["calendars"],
-                data["exceptions"],
-            ):
-                continue
-
-            departure_seconds = passage.get("_departure_seconds")
-
-            if (
-                after_seconds is not None
-                and departure_seconds is not None
-                and departure_seconds < after_seconds
-            ):
-                continue
-
-            item = {
-                key: value
-                for key, value in passage.items()
-                if not key.startswith("_")
-            }
-            results.append(item)
-
-    results.sort(
-        key=lambda item: (
-            time_seconds(item.get("departure_time", ""))
-            if time_seconds(item.get("departure_time", "")) is not None
-            else 10**12
-        )
-    )
-
-    results = results[:limit]
-
-    return {
-        "ok": True,
-        "date": service_date.isoformat(),
-        "count": len(results),
-        "passages": results,
-        "realtime_join": "not_applied",
-    }
